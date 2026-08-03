@@ -1,0 +1,585 @@
+import { z } from 'zod';
+
+import type { SimplifiedPaint } from './design-context-dedupe.js';
+import {
+  MIXED,
+  SerializedAnnotationSchema,
+  SerializedAutoLayoutSchema,
+  SerializedComponentPropertySchema,
+  SerializedConstraintsSchema,
+  SerializedEffectSchema,
+  SerializedFontNameSchema,
+  SerializedGridChildSchema,
+  SerializedHyperlinkSchema,
+  SerializedLayoutGridSchema,
+  SerializedLetterSpacingSchema,
+  SerializedLineHeightSchema,
+  SerializedMainComponentSchema,
+  SerializedPaintSchema,
+  SerializedStyleIdsSchema,
+} from './serialized-node.js';
+import type {
+  SerializedAnnotation,
+  SerializedAutoLayout,
+  SerializedComponentProperty,
+  SerializedConstraints,
+  SerializedEffect,
+  SerializedGridChild,
+  SerializedHyperlink,
+  SerializedLayoutGrid,
+  SerializedLetterSpacing,
+  SerializedLineHeight,
+  SerializedMainComponent,
+  SerializedPaint,
+  SerializedStyleIds,
+} from './serialized-node.js';
+
+export const DETAIL_LEVELS = ['minimal', 'compact', 'full'] as const;
+export type DetailLevel = (typeof DETAIL_LEVELS)[number];
+
+/**
+ * One run of uniform styling inside a mixed-style TEXT node (full detail only). Without this a node
+ * with inline variation reads as `fontSize: "mixed"` / `textDecoration: "mixed"` with no way to
+ * tell _which_ characters are the bold word, the underlined link, the coloured span — so codegen
+ * flattens the whole string to one style (the classic "Terms and Privacy Policy" link with no
+ * underline). `fills` are simplified to hex like every other paint in this view; `start`/`end` are
+ * char offsets into the node's `characters`.
+ */
+export interface DesignContextTextSegment {
+  characters: string;
+  start: number;
+  end: number;
+  fontName: z.infer<typeof SerializedFontNameSchema>;
+  fontSize: number;
+  fills: readonly SimplifiedPaint[];
+  textDecoration: string;
+  textCase: string;
+  // Per-run structural bits the node-level `mixed` markers flag but can't locate: an inline link
+  // (→ `<a>`), a list item (→ `<ol>`/`<ul>`) at some indentation, or per-run leading/tracking.
+  // Each omitted at its no-op default so a plain run stays lean.
+  lineHeight?: SerializedLineHeight | typeof MIXED;
+  letterSpacing?: SerializedLetterSpacing | typeof MIXED;
+  hyperlink?: SerializedHyperlink;
+  listOptions?: string;
+  indentation?: number;
+  // Per-run design-system bindings (ids resolved to names in the top-level `styles` / `variables`
+  // maps, like a node's own). A run's shared text/fill style + variable bindings — the only place a
+  // token survives on a mixed TEXT node, whose node-level fills read `mixed`.
+  styleIds?: SerializedStyleIds;
+  boundVariables?: Readonly<Record<string, readonly string[]>>;
+}
+
+/**
+ * Token-efficient, depth-limited tree node for LLM exploration. Fields populate by detail level:
+ *
+ * No-op defaults are omitted at every level (absent visible = true, rotation = 0, opacity = 1,
+ * cornerRadius = 0).
+ *
+ * - Minimal: id / name / type
+ * - Compact: + x / y / width / height (+ visible only when hidden)
+ * - Full: + rotation / opacity / cornerRadius / fills / text mixin `truncated` marks children dropped
+ *   at the depth limit; `deduped` marks an instance whose main component was already expanded (its
+ *   children are omitted), with `mainComponentId` for cross-ref. A deduped instance keeps its own
+ *   `textOverrides` — the visible text it actually renders — and `propertyOverrides` — the visual
+ *   fields it renders differently from the main component (recoloured title, hidden badge) — so
+ *   codegen gets per-instance content _and_ per-instance styling without re-expanding the collapsed
+ *   subtree (every card title / list item / form label differs).
+ *
+ * Grounding fields (M3): `styleIds` / `boundVariables` link a node to design-system styles and
+ * variables (id → token name, resolved downstream); `componentProperties` carries an INSTANCE's
+ * resolved variant/boolean/text/swap values (component_map's variant/size source); `mainComponent`
+ * names the library component an INSTANCE points to. These survive dedup on the instance itself —
+ * only the expanded child subtree is collapsed.
+ */
+export interface DesignContextNode {
+  id: string;
+  name: string;
+  type: string;
+  visible?: boolean;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  rotation?: number;
+  opacity?: number;
+  cornerRadius?: number | typeof MIXED;
+  /**
+   * Per-corner radii when cornerRadius is `mixed` → border-top-left-radius / …
+   * (cards/tabs/bubbles).
+   */
+  cornerRadii?: { topLeft: number; topRight: number; bottomRight: number; bottomLeft: number };
+  /** Layer blend mode (MULTIPLY / SCREEN / OVERLAY …); omitted when normal (PASS_THROUGH). */
+  blendMode?: string;
+  /** True when this node masks (clips) its later siblings. */
+  isMask?: boolean;
+  /** Mask clipping mode: ALPHA / LUMINANCE / GEOMETRY (only when isMask). */
+  maskType?: string;
+  /**
+   * Ellipse arc geometry (EllipseNode only): a partial sweep → pie slice / gauge, or a non-zero
+   * innerRadius → ring / donut. Omitted for a plain full disc. Angles in radians; innerRadius 0–1.
+   * Codegen renders these as an SVG arc / conic-gradient, not a solid circle.
+   */
+  arcData?: { startingAngle: number; endingAngle: number; innerRadius: number };
+  fills?: readonly z.infer<typeof SerializedPaintSchema>[] | typeof MIXED;
+  strokes?: readonly SerializedPaint[];
+  strokeWeight?: number | typeof MIXED;
+  /**
+   * Per-side stroke weights when strokeWeight is `mixed`; 0 = no border on that side, non-zero →
+   * border-t / border-r / border-b / border-l.
+   */
+  strokeWeights?: { top: number; right: number; bottom: number; left: number };
+  strokeAlign?: string;
+  /** Dash pattern (px on/off) → `border-style: dashed`/`dotted`; omitted for a solid stroke. */
+  dashPattern?: readonly number[];
+  /** Stroke line cap (ROUND / SQUARE / arrows); omitted when NONE. */
+  strokeCap?: string;
+  /** Stroke line join (ROUND / BEVEL); omitted at the MITER default. */
+  strokeJoin?: string;
+  effects?: readonly SerializedEffect[];
+  // auto-layout / positioning — surfaced to the main grounding tool (not just get_node) so codegen
+  // reads exact padding / gap / justify / align instead of inferring them from geometry. H/V carry
+  // itemSpacing + align on `layout`; GRID carries grid counts/gaps on `layout` + per-child placement
+  // on `gridChild`.
+  layout?: SerializedAutoLayout;
+  layoutSizingHorizontal?: string;
+  layoutSizingVertical?: string;
+  layoutGrow?: number;
+  layoutAlign?: string;
+  layoutPositioning?: string;
+  /**
+   * Min/max size bounds (auto-layout frames and their direct children) — explicit responsive
+   * constraints (→ min-w / max-w / min-h / max-h); only set bounds surface.
+   */
+  minWidth?: number;
+  maxWidth?: number;
+  minHeight?: number;
+  maxHeight?: number;
+  gridChild?: SerializedGridChild;
+  constraints?: SerializedConstraints;
+  clipsContent?: boolean;
+  /**
+   * A frame's own layout grids (COLUMNS / ROWS / GRID) — the explicit responsive column scaffold a
+   * designer defines (12-col, baseline). Ground-truth breakpoint structure codegen otherwise
+   * infers; present only on frames that define grids. Distinct from `layout` (auto-layout of
+   * children).
+   */
+  layoutGrids?: readonly SerializedLayoutGrid[];
+  /**
+   * Scroll behaviour of a clipping frame (HORIZONTAL / VERTICAL / BOTH) → overflow; omitted when
+   * NONE.
+   */
+  overflowDirection?: string;
+  /** Leading children pinned while the rest scroll → `position: sticky`; omitted at 0. */
+  numberOfFixedChildren?: number;
+  /** Locked width:height resize ratio → CSS `aspect-ratio: x / y`; omitted when unlocked. */
+  targetAspectRatio?: { x: number; y: number };
+  /**
+   * Dev Mode annotations pinned to this node — designer notes written FOR the developer; ground
+   * truth that outranks any inference. Omitted when none.
+   */
+  annotations?: readonly SerializedAnnotation[];
+  characters?: string;
+  fontSize?: number | typeof MIXED;
+  fontName?: z.infer<typeof SerializedFontNameSchema> | typeof MIXED;
+  // Typography that a Figma *text style* captures — folded into the `textStyle` bundle by dedup
+  // (like fontSize/fontName) so a style shared by N nodes costs one entry. Surfaced because codegen
+  // otherwise eyeballs casing/leading/tracking/underlines off the raster (wrong-case buttons, missing
+  // link underlines, off vertical rhythm are the classic misses). `mixed` = per-segment styling.
+  lineHeight?: SerializedLineHeight | typeof MIXED;
+  letterSpacing?: SerializedLetterSpacing | typeof MIXED;
+  textCase?: string | typeof MIXED;
+  textDecoration?: string | typeof MIXED;
+  /**
+   * Space between paragraphs (px) and first-line indent (px) — without them multi-paragraph text
+   * (article bodies, FAQs) renders with the paragraphs butted together / unindented. Style-level
+   * like lineHeight (a Figma text style carries both), so dedup folds them into the textStyle
+   * bundle. Omitted at the 0 default.
+   */
+  paragraphSpacing?: number;
+  paragraphIndent?: number;
+  // Per-node text behaviour (not part of the shared style) — stays inline: the same heading style is
+  // centered here, left there; truncation/maxLines vary per instance. → text-align / line-clamp.
+  textAlignHorizontal?: string;
+  textAlignVertical?: string;
+  textTruncation?: string;
+  maxLines?: number | null;
+  /**
+   * How the text box sizes: NONE = fixed box, HEIGHT = fixed width + auto height (the width is a
+   * real wrap constraint), TRUNCATE = legacy ellipsis. Omitted at the WIDTH_AND_HEIGHT (hug)
+   * default. Outside auto-layout this is the only signal whether width/height are constraints to
+   * emit or just the text's own rendered size.
+   */
+  textAutoResize?: string;
+  /**
+   * Node-level hyperlink (the whole text is one link → `<a href>`); partial links live in
+   * `segments`.
+   */
+  hyperlink?: SerializedHyperlink;
+  // Per-run styling of a *mixed* TEXT node — the only way to recover which characters carry the
+  // inline bold / link / coloured span that the node-level `mixed` markers flag but can't locate.
+  // Present only when the node is actually mixed (so uniform text stays clean).
+  segments?: readonly DesignContextTextSegment[];
+  styleIds?: SerializedStyleIds;
+  boundVariables?: Readonly<Record<string, readonly string[]>>;
+  componentProperties?: Readonly<Record<string, SerializedComponentProperty>>;
+  /**
+   * Motion (beta) summary — attached at full detail to nodes that carry animation, so codegen sees
+   * that a layer animates (and how) without a separate get_node_motion call. Compact by design: the
+   * applied preset names, the animated property fields, and the containing timeline's duration —
+   * never the full keyframe data (get_node_motion has that).
+   */
+  motion?: MotionSummary;
+  mainComponent?: SerializedMainComponent;
+  mainComponentId?: string;
+  /**
+   * GlobalVars refs (P3): when style dedup runs (full detail), inline `fills` / `strokes` /
+   * `effects` / (`fontSize` + `fontName`) are replaced by these refs into `globalVars.styles` — a
+   * style shared by N nodes costs one entry + N refs. `fill` / `stroke` point at paint arrays,
+   * `effect` at a shadow/blur array, `textStyle` at a typography bundle.
+   */
+  fill?: string;
+  stroke?: string;
+  effect?: string;
+  textStyle?: string;
+  deduped?: boolean;
+  /**
+   * Per-instance text content of a deduped instance: every visible TEXT descendant's actual
+   * `characters` ({ name, characters }, DFS order). Only emitted on deduped instances (the
+   * non-deduped first instance still carries its text inline in the expanded subtree). Text-only by
+   * design — structure/style stay collapsed, so the codegen "un-deduped vs N-drill" tradeoff goes
+   * away while the output stays small.
+   */
+  textOverrides?: readonly { name: string; characters: string }[];
+  /**
+   * Per-instance NON-text overrides of a deduped instance — the visual counterpart to
+   * `textOverrides`. The fields a child renders that differ from the main component: fill colour,
+   * stroke, effect, radius, opacity, blend, and visibility (hiding an optional element). Without
+   * this a deduped instance that recolours its title or hides a badge would silently collapse to
+   * the main component's defaults (the "every card looks identical" miss). Derived from Figma's
+   * native `instance.overrides`, so only genuinely-changed nodes appear; paints are simplified to
+   * hex like `globalVars` values. Text content stays in `textOverrides`. Only emitted on deduped
+   * instances that actually carry such overrides.
+   */
+  propertyOverrides?: readonly {
+    name: string;
+    visible?: boolean;
+    opacity?: number;
+    cornerRadius?: number;
+    cornerRadii?: unknown;
+    fills?: readonly unknown[];
+    strokes?: readonly unknown[];
+    strokeWeight?: number;
+    strokeAlign?: string;
+    effects?: readonly unknown[];
+    blendMode?: string;
+  }[];
+  truncated?: boolean;
+  children?: readonly DesignContextNode[];
+}
+
+/** Compact Motion (beta) summary for a node — see {@link DesignContextNode.motion}. */
+export interface MotionSummary {
+  /** Applied animation-style preset names. */
+  animationStyles?: readonly string[];
+  /**
+   * Field names that carry keyframes (PROPERTY names like TRANSLATION_X, plus
+   * fills/strokes/effects).
+   */
+  animatedProperties?: readonly string[];
+  /** Duration in seconds of the timeline this node participates in. */
+  timelineDuration?: number;
+}
+
+// Cast through unknown: zod's .optional() outputs `T | undefined`, while DesignContextNode uses
+// bare optionals under exactOptionalPropertyTypes. Functionally identical at runtime.
+export const DesignContextNodeSchema = z.lazy(() =>
+  z.object({
+    id: z.string(),
+    name: z.string(),
+    type: z.string(),
+    visible: z.boolean().optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+    width: z.number().optional(),
+    height: z.number().optional(),
+    rotation: z.number().optional(),
+    opacity: z.number().optional(),
+    cornerRadius: z.union([z.number(), z.literal(MIXED)]).optional(),
+    cornerRadii: z
+      .object({
+        topLeft: z.number(),
+        topRight: z.number(),
+        bottomRight: z.number(),
+        bottomLeft: z.number(),
+      })
+      .optional(),
+    blendMode: z.string().optional(),
+    isMask: z.boolean().optional(),
+    maskType: z.string().optional(),
+    arcData: z
+      .object({
+        startingAngle: z.number(),
+        endingAngle: z.number(),
+        innerRadius: z.number(),
+      })
+      .optional(),
+    fills: z.union([z.array(SerializedPaintSchema), z.literal(MIXED)]).optional(),
+    strokes: z.array(SerializedPaintSchema).optional(),
+    strokeWeight: z.union([z.number(), z.literal(MIXED)]).optional(),
+    strokeWeights: z
+      .object({ top: z.number(), right: z.number(), bottom: z.number(), left: z.number() })
+      .optional(),
+    strokeAlign: z.string().optional(),
+    dashPattern: z.array(z.number()).optional(),
+    strokeCap: z.string().optional(),
+    strokeJoin: z.string().optional(),
+    effects: z.array(SerializedEffectSchema).optional(),
+    layout: SerializedAutoLayoutSchema.optional(),
+    layoutSizingHorizontal: z.string().optional(),
+    layoutSizingVertical: z.string().optional(),
+    layoutGrow: z.number().optional(),
+    layoutAlign: z.string().optional(),
+    layoutPositioning: z.string().optional(),
+    minWidth: z.number().optional(),
+    maxWidth: z.number().optional(),
+    minHeight: z.number().optional(),
+    maxHeight: z.number().optional(),
+    gridChild: SerializedGridChildSchema.optional(),
+    constraints: SerializedConstraintsSchema.optional(),
+    clipsContent: z.boolean().optional(),
+    layoutGrids: z.array(SerializedLayoutGridSchema).optional(),
+    overflowDirection: z.string().optional(),
+    numberOfFixedChildren: z.number().optional(),
+    targetAspectRatio: z.object({ x: z.number(), y: z.number() }).optional(),
+    annotations: z.array(SerializedAnnotationSchema).optional(),
+    characters: z.string().optional(),
+    fontSize: z.union([z.number(), z.literal(MIXED)]).optional(),
+    fontName: z.union([SerializedFontNameSchema, z.literal(MIXED)]).optional(),
+    lineHeight: z.union([SerializedLineHeightSchema, z.literal(MIXED)]).optional(),
+    letterSpacing: z.union([SerializedLetterSpacingSchema, z.literal(MIXED)]).optional(),
+    textCase: z.union([z.string(), z.literal(MIXED)]).optional(),
+    textDecoration: z.union([z.string(), z.literal(MIXED)]).optional(),
+    paragraphSpacing: z.number().optional(),
+    paragraphIndent: z.number().optional(),
+    textAlignHorizontal: z.string().optional(),
+    textAlignVertical: z.string().optional(),
+    textTruncation: z.string().optional(),
+    maxLines: z.number().nullable().optional(),
+    textAutoResize: z.string().optional(),
+    hyperlink: SerializedHyperlinkSchema.optional(),
+    // Simplified paints are opaque here (hex lives in `color`), mirroring globalVars' z.unknown().
+    segments: z
+      .array(
+        z.object({
+          characters: z.string(),
+          start: z.number(),
+          end: z.number(),
+          fontName: SerializedFontNameSchema,
+          fontSize: z.number(),
+          fills: z.array(z.unknown()),
+          textDecoration: z.string(),
+          textCase: z.string(),
+          lineHeight: z.union([SerializedLineHeightSchema, z.literal(MIXED)]).optional(),
+          letterSpacing: z.union([SerializedLetterSpacingSchema, z.literal(MIXED)]).optional(),
+          hyperlink: SerializedHyperlinkSchema.optional(),
+          listOptions: z.string().optional(),
+          indentation: z.number().optional(),
+          styleIds: SerializedStyleIdsSchema.optional(),
+          boundVariables: z.record(z.string(), z.array(z.string())).optional(),
+        }),
+      )
+      .optional(),
+    styleIds: SerializedStyleIdsSchema.optional(),
+    boundVariables: z.record(z.string(), z.array(z.string())).optional(),
+    componentProperties: z.record(z.string(), SerializedComponentPropertySchema).optional(),
+    motion: z
+      .object({
+        animationStyles: z.array(z.string()).optional(),
+        animatedProperties: z.array(z.string()).optional(),
+        timelineDuration: z.number().optional(),
+      })
+      .optional(),
+    mainComponent: SerializedMainComponentSchema.optional(),
+    mainComponentId: z.string().optional(),
+    fill: z.string().optional(),
+    stroke: z.string().optional(),
+    effect: z.string().optional(),
+    textStyle: z.string().optional(),
+    deduped: z.boolean().optional(),
+    textOverrides: z.array(z.object({ name: z.string(), characters: z.string() })).optional(),
+    // Visual fields are opaque here (simplified paints carry hex in `color`), mirroring segments /
+    // globalVars' z.unknown().
+    propertyOverrides: z
+      .array(
+        z.object({
+          name: z.string(),
+          visible: z.boolean().optional(),
+          opacity: z.number().optional(),
+          cornerRadius: z.number().optional(),
+          cornerRadii: z.unknown().optional(),
+          fills: z.array(z.unknown()).optional(),
+          strokes: z.array(z.unknown()).optional(),
+          strokeWeight: z.number().optional(),
+          strokeAlign: z.string().optional(),
+          effects: z.array(z.unknown()).optional(),
+          blendMode: z.string().optional(),
+        }),
+      )
+      .optional(),
+    truncated: z.boolean().optional(),
+    children: z.array(DesignContextNodeSchema).optional(),
+  }),
+) as unknown as z.ZodType<DesignContextNode>;
+
+/**
+ * A resolved design-system token: the human name a node's `styleIds` / `boundVariables` id points
+ * to (e.g. `Primary/500`, `size/sm`, `Body/Bold`) plus its kind. Resolution is deduped into the
+ * top-level `variables` / `styles` maps so a token referenced by 100 nodes costs one entry — nodes
+ * keep the id, the consumer joins id → name. The node's own inline value (fill color, fontSize, …)
+ * remains the fallback when a ref is unresolved (e.g. a library var not subscribed).
+ *
+ * `codeSyntax` (variables only) is the code-side name the designer declared per platform (WEB /
+ * ANDROID / iOS → e.g. `--color-primary`) — authoritative naming intent when present, skipping the
+ * heuristic name join; verify it against the project's actual tokens before emitting (it can go
+ * stale after a codebase migration). Omitted when the variable declares none.
+ */
+export const ResolvedTokenSchema = z.object({
+  name: z.string(),
+  type: z.string(),
+  codeSyntax: z.record(z.string(), z.string()).optional(),
+});
+export type ResolvedToken = z.infer<typeof ResolvedTokenSchema>;
+
+/**
+ * Deduplicated style table (P3). Keys are content-hash ids (`fill_AB12CD`, `text_9F3K2L`) so the
+ * same style always maps to the same id — output is stable across runs and diffable (unlike
+ * Framelink's random ids). Values are opaque style bundles (paint arrays / typography); the
+ * consumer renders them per profile (Tailwind class / CSS var / …) via an adapter.
+ */
+export const GlobalVarsSchema = z.object({
+  styles: z.record(z.string(), z.unknown()),
+});
+export type GlobalVars = z.infer<typeof GlobalVarsSchema>;
+
+/** Quantifies the simplification — chiefly the dedup win (inline vs deduped byte size). */
+export const DesignContextMetricsSchema = z.object({
+  nodeCount: z.number(),
+  maxDepth: z.number(),
+  styleCount: z.number(),
+  tokenCount: z.number(),
+  inlineSizeKb: z.number(),
+  dedupedSizeKb: z.number(),
+});
+export type DesignContextMetrics = z.infer<typeof DesignContextMetricsSchema>;
+
+// Guardrail budgets for get_design_context (the hot grounding read). Two nets, outer coarse + inner
+// precise, both firing ONLY on the public tool path (the mcp layer marks it with budget: true);
+// internal consumers (design_diff snapshots, component/icon map walks) read the payload in-process —
+// it never enters an LLM context — so they always get the raw tree.
+//
+// - DESIGN_CONTEXT_BAIL_NODES gates plugin-side, BEFORE serialization: a cheap sync count walk so a
+//   hopeless tree skips the heavy main-thread work entirely. The count can't model dedupeComponents
+//   (it shrinks the payload, not the visit count), so the threshold is deliberately high — real
+//   whole-page groundings of several hundred nodes succeed today and must keep working; only
+//   pathological sizes bail.
+// - DESIGN_CONTEXT_CHAR_BUDGET gates mcp-side, AFTER serialization: the precise net. Anchored to
+//   Claude Code's default MCP result cap (MAX_MCP_OUTPUT_TOKENS = 25k tokens ≈ 100k chars of
+//   minified JSON) — a result beyond it errors out today and delivers nothing, so replacing it with
+//   a section plan is strictly an upgrade.
+export const DESIGN_CONTEXT_BAIL_NODES = 1500;
+export const DESIGN_CONTEXT_CHAR_BUDGET = 100_000;
+
+/** One entry of a section plan: a subtree the caller should ground individually. */
+export const DesignContextSectionSchema = z.object({
+  nodeId: z.string(),
+  name: z.string(),
+  type: z.string(),
+  /** Direct children of the section (0 = a leaf). */
+  childCount: z.number(),
+  /** Total nodes in the section's subtree — the size signal for splitting further. */
+  nodes: z.number(),
+});
+export type DesignContextSection = z.infer<typeof DesignContextSectionSchema>;
+
+export const DesignContextSectionPlanSchema = z.object({
+  /** Which net fired: the plugin's pre-serialization node count, or the mcp payload-size net. */
+  reason: z.enum(['node-count', 'payload-size']),
+  /** Nodes the full call would have serialized (node-count reason). */
+  totalNodes: z.number().optional(),
+  /** Serialized size in chars of the payload that was withheld (payload-size reason). */
+  payloadChars: z.number().optional(),
+  sections: z.array(DesignContextSectionSchema),
+  /** How many sections were dropped when the plan itself had to be capped (very wide flat trees). */
+  sectionsOmitted: z.number().optional(),
+});
+export type DesignContextSectionPlan = z.infer<typeof DesignContextSectionPlanSchema>;
+
+/** One project design token a raw color value maps to: the literal to emit + the property name. */
+export const ProjectTokenMatchSchema = z.object({
+  /**
+   * The reference codegen should emit: a Tailwind utility base on a Tailwind project, else
+   * var(--name).
+   */
+  ref: z.string(),
+  /** Custom property name without the leading `--`. */
+  name: z.string(),
+});
+export type ProjectTokenMatch = z.infer<typeof ProjectTokenMatchSchema>;
+
+/**
+ * The value-reverse join annotation for one raw color: a single entry when exactly one project
+ * token carries that value, or an unordered candidates list when several share it (the caller picks
+ * by meaning, never blindly). Every entry carries `matchedBy: ['value']` — the same weak-evidence
+ * vocabulary token_map uses — so it self-documents as a name-blind hypothesis to verify, never a
+ * resolved binding: a bound Figma variable or a token_map name match always outranks it, and when
+ * the token doesn't fit the context semantically the raw value is the right emit.
+ */
+export const ProjectTokenAnnotationSchema = z.union([
+  ProjectTokenMatchSchema.extend({ matchedBy: z.tuple([z.literal('value')]) }),
+  z.object({
+    matchedBy: z.tuple([z.literal('value')]),
+    candidates: z.array(ProjectTokenMatchSchema),
+  }),
+]);
+export type ProjectTokenAnnotation = z.infer<typeof ProjectTokenAnnotationSchema>;
+
+export const GetDesignContextResultSchema = z.object({
+  nodes: z.array(DesignContextNodeSchema),
+  /**
+   * Server-side guidance attached only when the call shape risks a known failure mode — currently a
+   * selection of several top-level frames spanning different width buckets (a breakpoint set),
+   * which is what tempts a caller to size one breakpoint by eye off another. Surfaced on the result
+   * so even a caller that bypassed the design-to-code skill gets the don't-merge-breakpoints rule.
+   * Omitted when there's nothing to warn about.
+   */
+  hint: z.string().optional(),
+  /**
+   * Set when the requested tree was too large to return whole (see the budget constants above):
+   * `nodes` then holds only the roots' identity (minimal projection) and `sections` lists the
+   * subtrees to ground individually — call get_design_context per section nodeId at full detail.
+   */
+  sectionPlan: DesignContextSectionPlanSchema.optional(),
+  /**
+   * One-line, deterministic guidance attached by the mcp layer: on a below-full detail it points
+   * codegen callers at detail 'full'; on a section plan it spells out the per-section next step.
+   */
+  note: z.string().optional(),
+  /** Deduplicated style table; nodes carry `fill` / `textStyle` refs into it. Full detail only. */
+  globalVars: GlobalVarsSchema.optional(),
+  /** Id → token, for variable ids referenced by any node's `boundVariables`. Omitted when empty. */
+  variables: z.record(z.string(), ResolvedTokenSchema).optional(),
+  /** Id → token, for shared-style ids referenced by any node's `styleIds`. Omitted when empty. */
+  styles: z.record(z.string(), ResolvedTokenSchema).optional(),
+  /**
+   * Raw color → project design token(s) with that exact value (the value-reverse join), keyed by
+   * the color string exactly as it appears in this payload — so a caller about to emit a raw hex
+   * can look it up verbatim. Attached by the mcp layer on public full-detail results when the
+   * project's CSS defines matching tokens; omitted when empty. Value-equality evidence only: prefer
+   * a semantically fitting entry (or keep the raw value) over blind use, and let a bound Figma
+   * variable win over a raw-value match.
+   */
+  projectTokens: z.record(z.string(), ProjectTokenAnnotationSchema).optional(),
+  /** Simplification metrics; full detail only. */
+  metrics: DesignContextMetricsSchema.optional(),
+});
+export type GetDesignContextResult = z.infer<typeof GetDesignContextResultSchema>;

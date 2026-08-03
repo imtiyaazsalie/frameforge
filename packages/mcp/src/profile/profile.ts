@@ -1,0 +1,394 @@
+import { readFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+
+import { walkRepoFiles } from '../repo-walk.js';
+
+// Project Profile — the structured "how this project writes code" that the join tools (component_map,
+// token_map) switch their target side on. Detection is split in two: gatherProjectInput does the IO
+// (reads manifests / probes for config files / scans CSS entry points) and detectProfile is a pure
+// function over that snapshot, so the decision logic is snapshot-testable without a real filesystem.
+// This first cut covers the JS/TS ecosystem; the framework/styling detectors are an ordered cascade so
+// a PHP (composer.json) or .NET (*.csproj) detector is just another entry appended later.
+
+export const FRAMEWORKS = [
+  'next',
+  'nuxt',
+  'react',
+  'vue',
+  'svelte',
+  'solid',
+  'angular',
+  'unknown',
+] as const;
+export type Framework = (typeof FRAMEWORKS)[number];
+
+export const STYLING_SYSTEMS = [
+  'tailwind',
+  'css-variables',
+  'scss',
+  'css-modules',
+  'plain-css',
+  'unknown',
+] as const;
+export type StylingSystem = (typeof STYLING_SYSTEMS)[number];
+
+// How the project consumes `import X from './icon.svg'`: `component` when a loader turns the svg into
+// a renderable component (svgr / vite-svg-loader / …) so codegen can emit `<Icon/>`; `url` otherwise
+// (the bundler default resolves svg to a URL string → `<img src>` or inline svg). Picking wrong
+// produces an import that doesn't run, so the icon-export step grounds this off the project.
+export const SVG_IMPORT_MODES = ['component', 'url'] as const;
+export type SvgImportMode = (typeof SVG_IMPORT_MODES)[number];
+
+export interface ProjectProfile {
+  rootDir: string;
+  framework: Framework;
+  /** Ts when a tsconfig or the typescript dep is present, else js. */
+  language: 'ts' | 'js';
+  styling: {
+    system: StylingSystem;
+    /**
+     * Where the styling tokens live, when found: a tailwind.config.* for Tailwind v3, or the CSS
+     * file holding `@import "tailwindcss"` / `@theme` for v4 (which has no JS config). token_map
+     * reads its token definitions from here, so the path must point at the right source per
+     * version.
+     */
+    configPath?: string;
+    /** Tailwind major version (3 or 4) — v4 is CSS-first, changing where tokens are defined. */
+    tailwindVersion?: number;
+  };
+  /**
+   * How the project turns an imported .svg into something renderable — so codegen imports/uses
+   * exported icons the way the build actually supports (a wrong guess ships an import that won't
+   * run).
+   */
+  svg: {
+    /** `component` (a loader is present → `<Icon/>`) or `url` (no loader → `<img src>` / inline). */
+    mode: SvgImportMode;
+    /** The detected loader/plugin enabling component mode (svgr / vite-svg-loader / …), if any. */
+    loader?: string;
+    /**
+     * A ready import example for the detected loader — the form differs (`?react` vs `?component`
+     * vs `{ ReactComponent }`), so codegen can copy this rather than guess the syntax.
+     */
+    importHint?: string;
+  };
+  /** File extensions that hold components for this framework — drives the scanner's glob. */
+  componentExtensions: string[];
+  /** Human-readable reasons for each conclusion; surfaced so a wrong guess is debuggable. */
+  evidence: string[];
+}
+
+/** Snapshot of the on-disk signals detection reasons about. Produced by gatherProjectInput. */
+export interface ProjectInput {
+  rootDir: string;
+  packageJson: PackageJson | null;
+  hasTsconfig: boolean;
+  /** Root-level config basenames that were found to exist (tailwind.config.*, etc.). */
+  presentConfigFiles: string[];
+  /**
+   * Repo-relative path to a CSS file that imports Tailwind / defines an @theme block (Tailwind v4
+   * CSS-first config). Undefined when no such marker was found.
+   */
+  tailwindCssEntry?: string;
+}
+
+interface PackageJson {
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+}
+
+const TAILWIND_CONFIGS = [
+  'tailwind.config.js',
+  'tailwind.config.cjs',
+  'tailwind.config.mjs',
+  'tailwind.config.ts',
+];
+
+/** Config files worth probing for at the project root; presence feeds styling detection. */
+const PROBE_CONFIG_FILES = [...TAILWIND_CONFIGS];
+
+// Tailwind v4 marks its CSS-first config inline: `@import "tailwindcss"` pulls the framework in and
+// `@theme { ... }` declares tokens. Either marker identifies the v4 token source.
+const CSS_TAILWIND_IMPORT = /@import\s+["']tailwindcss["']/;
+const CSS_THEME_BLOCK = /@theme\b/;
+
+const fileExists = async (path: string): Promise<boolean> => {
+  try {
+    await readFile(path);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const readJson = async <T>(path: string): Promise<T | null> => {
+  try {
+    return JSON.parse(await readFile(path, 'utf8')) as T;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Walk the repo's CSS files looking for the Tailwind v4 markers; returns the first matching file's
+ * repo-relative path, or undefined. Directory pruning + .gitignore handling live in walkRepoFiles.
+ */
+const findTailwindCssEntry = async (root: string): Promise<string | undefined> => {
+  for await (const rel of walkRepoFiles(root, { extensions: ['.css'], cap: 1000 })) {
+    let body: string;
+    try {
+      // eslint-disable-next-line no-await-in-loop -- sequential scan, stops at first match
+      body = await readFile(join(root, rel), 'utf8');
+    } catch {
+      continue;
+    }
+    if (CSS_TAILWIND_IMPORT.test(body) || CSS_THEME_BLOCK.test(body)) return rel;
+  }
+  return undefined;
+};
+
+/** Do the filesystem IO once, up front, so detectProfile can stay pure. */
+export const gatherProjectInput = async (rootDir: string): Promise<ProjectInput> => {
+  const root = resolve(rootDir);
+  const packageJson = await readJson<PackageJson>(join(root, 'package.json'));
+  const hasTsconfig = await fileExists(join(root, 'tsconfig.json'));
+
+  const presentConfigFiles: string[] = [];
+  for (const name of PROBE_CONFIG_FILES) {
+    // eslint-disable-next-line no-await-in-loop -- small fixed list, clarity over micro-parallelism
+    if (await fileExists(join(root, name))) presentConfigFiles.push(name);
+  }
+
+  const tailwindCssEntry = await findTailwindCssEntry(root);
+
+  return {
+    rootDir: root,
+    packageJson,
+    hasTsconfig,
+    presentConfigFiles,
+    ...(tailwindCssEntry === undefined ? {} : { tailwindCssEntry }),
+  };
+};
+
+const allDeps = (pkg: PackageJson | null): Record<string, string> => ({
+  ...pkg?.dependencies,
+  ...pkg?.devDependencies,
+});
+
+/** All dependencies (prod + dev) declared in the project's package.json, or {} when absent. */
+export const readProjectDeps = async (rootDir: string): Promise<Record<string, string>> =>
+  allDeps(await readJson<PackageJson>(join(resolve(rootDir), 'package.json')));
+
+/** Parse the leading major version out of a semver range like "^4.0.0" or "~3.4.1". */
+const parseMajor = (range: string | undefined): number | undefined => {
+  if (range === undefined) return undefined;
+  const m = /(\d+)/.exec(range);
+  return m === null ? undefined : Number(m[1]);
+};
+
+const COMPONENT_EXTENSIONS: Record<Framework, string[]> = {
+  next: ['.tsx', '.jsx'],
+  react: ['.tsx', '.jsx'],
+  nuxt: ['.vue'],
+  vue: ['.vue'],
+  svelte: ['.svelte'],
+  // Solid authors components as JSX in .tsx/.jsx, parsed by the same (react) extractor — only the
+  // emitted conventions differ (`class` not `className`, `createSignal`), which the framework label
+  // steers.
+  solid: ['.tsx', '.jsx'],
+  // Angular components are @Component-decorated classes in .ts (conventionally *.component.ts). The
+  // scanner reads every .ts but only keeps classes carrying @Component, so a service/pipe/guard .ts
+  // contributes nothing. .ts is Angular-exclusive here — no other framework globs it.
+  angular: ['.ts'],
+  unknown: ['.tsx', '.jsx', '.vue', '.svelte'],
+};
+
+/**
+ * Ordered framework cascade — meta-frameworks before the libraries they wrap (Next before React,
+ * Nuxt before Vue) so the most specific signal wins. Returns the matched framework + the evidence.
+ */
+const detectFramework = (
+  deps: Record<string, string>,
+): { framework: Framework; reason: string } => {
+  if ('next' in deps) return { framework: 'next', reason: 'next in dependencies' };
+  if ('nuxt' in deps) return { framework: 'nuxt', reason: 'nuxt in dependencies' };
+  if ('react' in deps) return { framework: 'react', reason: 'react in dependencies' };
+  if ('vue' in deps) return { framework: 'vue', reason: 'vue in dependencies' };
+  if ('svelte' in deps) return { framework: 'svelte', reason: 'svelte in dependencies' };
+  // solid-js is the base dep of both plain Solid and SolidStart, so one check covers both.
+  if ('solid-js' in deps) return { framework: 'solid', reason: 'solid-js in dependencies' };
+  // @angular/core is the base dep of every Angular app (incl. AnalogJS / Angular Universal).
+  if ('@angular/core' in deps)
+    return { framework: 'angular', reason: '@angular/core in dependencies' };
+  return { framework: 'unknown', reason: 'no known framework dependency' };
+};
+
+interface StylingResult {
+  system: StylingSystem;
+  configPath?: string;
+  tailwindVersion?: number;
+  reason: string;
+}
+
+/**
+ * Styling cascade. Tailwind is checked across all of its signals — v3 JS config file, v4 CSS-first
+ * import/theme markers, the tailwindcss dep, and the v4-only Vite/PostCSS packages — since missing
+ * the v4 case would silently drop the system where the token join actually earns its keep. SCSS
+ * next via deps; plain CSS / CSS custom properties need a CSS body scan to confirm and are left to
+ * a later pass (grounding already serves that path without an adapter).
+ */
+const detectStyling = (deps: Record<string, string>, input: ProjectInput): StylingResult => {
+  const depVersion = parseMajor(deps.tailwindcss);
+  const hasV4Pkg = '@tailwindcss/vite' in deps || '@tailwindcss/postcss' in deps;
+  const v3Config = input.presentConfigFiles.find(name => TAILWIND_CONFIGS.includes(name));
+
+  // Tailwind v4: CSS-first config (no JS config file). Strongest when a CSS entry was found.
+  if (input.tailwindCssEntry !== undefined && v3Config === undefined) {
+    return {
+      system: 'tailwind',
+      configPath: input.tailwindCssEntry,
+      tailwindVersion: depVersion ?? 4,
+      reason: `Tailwind v4 CSS config: ${input.tailwindCssEntry}`,
+    };
+  }
+  // Tailwind v3: JS/TS config file at the root.
+  if (v3Config !== undefined) {
+    return {
+      system: 'tailwind',
+      configPath: v3Config,
+      tailwindVersion: depVersion ?? 3,
+      reason: `found ${v3Config}`,
+    };
+  }
+  // Dep-only signal (config not located): trust the version, default to v4 for the v4-only packages.
+  if (depVersion !== undefined || hasV4Pkg) {
+    return {
+      system: 'tailwind',
+      tailwindVersion: depVersion ?? 4,
+      reason: hasV4Pkg ? '@tailwindcss/* package in dependencies' : 'tailwindcss in dependencies',
+    };
+  }
+  if ('sass' in deps || 'node-sass' in deps)
+    return { system: 'scss', reason: 'sass in dependencies' };
+  return { system: 'unknown', reason: 'no styling signal in manifest' };
+};
+
+interface SvgResult {
+  mode: SvgImportMode;
+  loader?: string;
+  importHint?: string;
+  reason: string;
+}
+
+// Ordered by specificity; the import form is loader-specific (Vite's svgr uses `?react`, vite-svg-
+// loader uses `?component`, classic @svgr/webpack exports `ReactComponent`), so each carries its own
+// ready example. Dep presence is the signal — the loader still has to be wired in the bundler config,
+// so the guidance reminds codegen to confirm, but a present dep is a strong intent signal.
+const SVG_LOADERS: { dep: string; loader: string; hint: string }[] = [
+  {
+    dep: 'vite-plugin-svgr',
+    loader: 'vite-plugin-svgr',
+    hint: "import Icon from './icon.svg?react'",
+  },
+  {
+    dep: 'vite-svg-loader',
+    loader: 'vite-svg-loader',
+    hint: "import Icon from './icon.svg?component'",
+  },
+  {
+    dep: 'vite-plugin-solid-svg',
+    loader: 'vite-plugin-solid-svg',
+    hint: "import Icon from './icon.svg?component-solid'",
+  },
+  {
+    dep: '@svgr/webpack',
+    loader: '@svgr/webpack',
+    hint: "import { ReactComponent as Icon } from './icon.svg'",
+  },
+  { dep: '@svgr/rollup', loader: '@svgr/rollup', hint: "import Icon from './icon.svg'" },
+  {
+    dep: 'unplugin-icons',
+    loader: 'unplugin-icons',
+    hint: "import Icon from '~icons/{collection}/{name}' (local svg via FileSystemIconLoader)",
+  },
+  {
+    dep: 'nuxt-svgo',
+    loader: 'nuxt-svgo',
+    hint: "import Icon from './icon.svg?component' (or <NuxtIcon>)",
+  },
+  {
+    dep: 'nuxt-svgo-loader',
+    loader: 'nuxt-svgo-loader',
+    hint: "import Icon from './icon.svg?component' (or a <SvgoIcon name> macro)",
+  },
+  { dep: '@nuxtjs/svg', loader: '@nuxtjs/svg', hint: "import Icon from './icon.svg?component'" },
+];
+
+/**
+ * Detect how .svg imports resolve, from the dependency manifest. Component mode when a known svg
+ * loader is present, else url mode (the bundler default). Pure over deps.
+ */
+const detectSvgHandling = (deps: Record<string, string>): SvgResult => {
+  for (const sig of SVG_LOADERS) {
+    if (sig.dep in deps) {
+      return {
+        mode: 'component',
+        loader: sig.loader,
+        importHint: sig.hint,
+        reason: `${sig.dep} → svg imports as a component`,
+      };
+    }
+  }
+  return {
+    mode: 'url',
+    reason: 'no svg loader dep → svg imports resolve to a URL (use <img src> or inline svg)',
+  };
+};
+
+/** Pure decision function over the gathered snapshot — the unit under test. */
+export const detectProfile = (input: ProjectInput): ProjectProfile => {
+  const deps = allDeps(input.packageJson);
+  const evidence: string[] = [];
+
+  const { framework, reason: fwReason } = detectFramework(deps);
+  evidence.push(`framework=${framework}: ${fwReason}`);
+
+  const language: 'ts' | 'js' = input.hasTsconfig || 'typescript' in deps ? 'ts' : 'js';
+  evidence.push(
+    `language=${language}: ${input.hasTsconfig ? 'tsconfig.json present' : 'typescript' in deps ? 'typescript dep' : 'no ts signal'}`,
+  );
+
+  const styling = detectStyling(deps, input);
+  evidence.push(
+    `styling=${styling.system}${styling.tailwindVersion === undefined ? '' : ` v${styling.tailwindVersion}`}: ${styling.reason}`,
+  );
+
+  const svg = detectSvgHandling(deps);
+  evidence.push(
+    `svg=${svg.mode}${svg.loader === undefined ? '' : ` (${svg.loader})`}: ${svg.reason}`,
+  );
+
+  return {
+    rootDir: input.rootDir,
+    framework,
+    language,
+    styling: {
+      system: styling.system,
+      ...(styling.configPath === undefined ? {} : { configPath: styling.configPath }),
+      ...(styling.tailwindVersion === undefined
+        ? {}
+        : { tailwindVersion: styling.tailwindVersion }),
+    },
+    svg: {
+      mode: svg.mode,
+      ...(svg.loader === undefined ? {} : { loader: svg.loader }),
+      ...(svg.importHint === undefined ? {} : { importHint: svg.importHint }),
+    },
+    componentExtensions: COMPONENT_EXTENSIONS[framework],
+    evidence,
+  };
+};
+
+/** Convenience: gather + detect in one call against a real directory. */
+export const analyzeProject = async (rootDir: string): Promise<ProjectProfile> =>
+  detectProfile(await gatherProjectInput(rootDir));

@@ -1,0 +1,48 @@
+{
+  "name": "frameforge",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Free, two-way Figma MCP server. Turn designs into framework-aware code, and push code back to the canvas. Works with Claude Code, Cursor, Codex, and any MCP client.",
+  "homepage": "https://github.com/imtiyaazsalie/frameforge",
+  "bugs": {
+    "url": "https://github.com/imtiyaazsalie/frameforge/issues"
+  },
+  "license": "MIT",
+  "author": "Imtiyaaz Salie",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/imtiyaazsalie/frameforge.git"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "clean": "pnpm -r exec rm -rf dist *.tsbuildinfo",
+    "dev": "pnpm -r --parallel run dev",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "knip": "knip",
+    "knip:fix": "knip --fix",
+    "lint": "oxlint --deny-warnings .",
+    "lint:fix": "oxlint --fix .",
+    "postinstall": "node scripts/sync-skills.mjs",
+    "release": "pnpm -C packages/mcp exec changelogen --release --no-github --output ../../CHANGELOG.md",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "pnpm -r run typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@vitest/coverage-v8": "^4.1.10",
+    "changelogen": "^0.6.2",
+    "knip": "^6.29.0",
+    "oxfmt": "^0.61.0",
+    "oxlint": "^1.76.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "packageManager": "pnpm@11.18.0"
+}
